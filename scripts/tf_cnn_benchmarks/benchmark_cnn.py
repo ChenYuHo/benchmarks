@@ -561,7 +561,7 @@ flags.DEFINE_integer('fp16_inc_loss_scale_every_n', 1000,
 #       an MPI framework (e.g. Open MPI). Each worker runs training on
 #       single GPU, and averages gradients using NCCL or MPI all-reduce.
 #       See https://github.com/uber/horovod for more details.
-flags.DEFINE_enum('variable_update', 'parameter_server',
+flags.DEFINE_enum('variable_update', 'horovod',
                   ('parameter_server', 'replicated', 'distributed_replicated',
                    'independent', 'distributed_all_reduce',
                    'collective_all_reduce', 'horovod'),
@@ -671,6 +671,30 @@ flags.DEFINE_string('benchmark_test_id', None,
                     'different test runs. This flag is designed for human '
                     'consumption, and does not have any impact within the '
                     'system.')
+
+flags.DEFINE_enum('horovod_compress_method', 'none',
+                  ('none', 'fp16', 'randomk', 'topk', 'threshold', 'terngrad', 'qsgd', 'dgc', 'adaq',
+                   'signsgd', 'signum', 'adas', 'onebit', 'powersgd', '8bit', 'natural', 'sketch'),
+                  'The method for compressing the variables used in hororvod')
+
+flags.DEFINE_enum('horovod_comm_method', 'allgather',
+                  ('allreduce', 'broadcast', 'centralized', 'allgather'),
+                  'The method for communicating the variables used in hororvod: allreduce, '
+                  'broadcast, centralized, allgather')
+
+flags.DEFINE_boolean('horovod_compress_memory', False, 'Whether to use memory for compression method')
+
+flags.DEFINE_boolean('horovod_gradient_clipping', False,
+                     'Whether to use gradient clipping before apply the compression')
+
+flags.DEFINE_float('horovod_compress_ratio', 0.1,
+                   'Set the sparsification ratio')
+
+flags.DEFINE_float('horovod_threshold_val', 0.001,
+                   'Set the threshold value')
+
+flags.DEFINE_integer('horovod_quantum_number', 256,
+                   'Set the quantum states for QSGD, default 256 states, minmum 1 state')
 
 platforms_util.define_platform_params()
 
@@ -934,10 +958,10 @@ def benchmark_one_step(sess,
 def get_perf_timing_str(speed_mean, speed_uncertainty, speed_jitter, scale=1):
   if scale == 1:
     # TODO(laigd): rename 'images' to maybe 'inputs', same below.
-    return ('images/sec: %.1f +/- %.1f (jitter = %.1f)' %
-            (speed_mean, speed_uncertainty, speed_jitter))
+    return ('images/sec: %.1f +/- %.1f (jitter = %.1f) %f' %
+            (speed_mean, speed_uncertainty, speed_jitter, time.time()))
   else:
-    return 'images/sec: %.1f' % speed_mean
+    return 'images/sec: %.1f %f' % (speed_mean, time.time())
 
 
 def get_perf_timing(batch_size, step_train_times, ewma_alpha=None, scale=1):
@@ -2032,8 +2056,8 @@ class BenchmarkCNN(object):
                             simple_value=result_value)
       if summary_writer:
         summary_writer.add_summary(summary, global_step)
-      log_fn('Accuracy @ 1 = %.4f Accuracy @ 5 = %.4f [%d examples]' %
-             (accuracy_at_1, accuracy_at_5, total_eval_count))
+      log_fn('Accuracy @ 1 = %.4f Accuracy @ 5 = %.4f [%d examples] %f' %
+             (accuracy_at_1, accuracy_at_5, total_eval_count, time.time()))
       elapsed_time = loop_end_time - loop_start_time
       images_per_sec = (self.num_batches * self.batch_size / elapsed_time)
       if self.mode != constants.BenchmarkMode.TRAIN_AND_EVAL:
@@ -3266,7 +3290,20 @@ class BenchmarkCNN(object):
         else:
           horovod_device = ''
         # All-reduce gradients using Horovod.
-        grads = [hvd.allreduce(grad, average=False, device_dense=horovod_device)
+        params = {
+            "compress_method": self.params.horovod_compress_method,
+            "comm_method": self.params.horovod_comm_method,
+            "use_memory": self.params.horovod_compress_memory,
+            "gradient_clipping": self.params.horovod_gradient_clipping,
+            "compress_ratio": self.params.horovod_compress_ratio,
+            "threshold_val": self.params.horovod_threshold_val,
+            "quantum_num": self.params.horovod_quantum_number,
+            "momentum": self.params.momentum,
+            "learning_rate": self.params.init_learning_rate
+        }
+        log_fn("========================== parameters passed to horovod ==========================")
+        log_fn(params)
+        grads = [hvd.allreduce(grad, average=False, device_dense=horovod_device, params=params)
                  for grad in grads]
 
       if self.params.staged_vars:
@@ -3539,3 +3576,4 @@ def maybe_compile(computation, params):
     return tf.xla.experimental.compile(computation)
   else:
     return computation()
+
